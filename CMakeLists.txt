@@ -20,4 +20,7 @@ option(MICROHOOK_BUILD_EXAMPLES "Build examples" ON)
 if(MICROHOOK_BUILD_EXAMPLES)
     add_executable(selfhook examples/selfhook/main.cpp)
     target_link_libraries(selfhook PRIVATE microhook)
+
+    add_executable(apitest examples/apitest/main.cpp)
+    target_link_libraries(apitest PRIVATE microhook)
 endif()
