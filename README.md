@@ -1,25 +1,8 @@
 # microhook
 
-Modern C++20 x64 inline-hooking library for Windows. ~600 LOC, no external deps.
+C++20 x64 inline hooking library for Windows. ~550 LOC, zero dependencies.
 
-## Intended use
-
-Built for legitimate Windows internals work — same audience as [Detours](https://github.com/microsoft/Detours), [MinHook](https://github.com/TsudaKageyu/minhook), and [Frida](https://frida.re/):
-
-- **Security research / EDR development** — exercising endpoint detection products with known hooking techniques
-- **Debugger and profiler tooling** — function-call interception is a core debugger primitive
-- **Game modding** — Windows modding ecosystems (Minecraft, Skyrim, etc.) commonly load DLL mods that hook game functions
-- **Learning** — inline hooking is a classic Windows-internals topic; this is a clean reference implementation
-
-**Don't hook code in processes you don't own or aren't authorized to test.**
-
-## What it does
-
-Patches the first instructions of an x64 function with a `jmp` to your detour function. Saves the original instructions to a trampoline so you can still call the unhooked version.
-
-- Length disassembly: hand-rolled mini x64 LDE (~250 LOC) that covers the common prologue instruction set (MOV/SUB/PUSH/CALL/JMP/conditional jumps/etc.)
-- Trampoline allocation: VirtualAlloc'd within ±2GB of the target so a 5-byte `jmp rel32` works (falls back to a 14-byte `jmp [rip+0]; .qword target` absolute when the detour is far)
-- Header-only public API: include `microhook/microhook.hpp`
+Patches function prologues with a `jmp` to your detour, saves the originals to a trampoline with full instruction relocation. Handles RIP-relative addressing, short branch expansion, and thread-safe patching out of the box.
 
 ## Use
 
@@ -37,13 +20,44 @@ int my_add(int a, int b) {
 }
 
 int main() {
-    microhook::install_t<AddFn>(real_add, my_add, g_hook);
+    auto s = microhook::install_t<AddFn>(real_add, my_add, g_hook);
     // real_add(2, 3) now returns 1005
 
+    microhook::disable(g_hook);
+    // real_add(2, 3) returns 5 — hook paused, trampoline kept
+
+    microhook::enable(g_hook);
+    // real_add(2, 3) returns 1005 again
+
     microhook::uninstall(g_hook);
-    // real_add(2, 3) returns 5 again
+    // hook fully removed
 }
 ```
+
+Works on local functions, vtable entries, and Win32 APIs (`GetTickCount64`, `MessageBoxA`, etc.).
+
+## How it works
+
+1. **Length disassembly** — hand-rolled LDE walks the prologue to find instruction boundaries. Covers all common x64 opcodes including two-byte `0F xx`, x87, and `F6`/`F7` TEST-with-immediate.
+
+2. **Instruction relocation** — stolen bytes are copied to a trampoline one instruction at a time. `[RIP+disp32]` addressing gets its displacement adjusted, short branches (`Jcc rel8`, `JMP rel8`) expand to their `rel32` equivalents, and `CALL`/`JMP rel32` offsets are recalculated.
+
+3. **Trampoline allocation** — a slab allocator carves 96-byte slots from shared 4KB pages within ±2GB of the target, so the patch site uses a compact 5-byte `jmp rel32`. Falls back to 14-byte absolute when needed.
+
+4. **Thread-safe patching** — all other threads are suspended during patch and unpatch via `CreateToolhelp32Snapshot` + `SuspendThread`, preventing torn reads of the partially-written jump.
+
+5. **INT3 padding** — any remaining stolen bytes after the jump are filled with `0xCC` so a stale jump into the middle crashes cleanly instead of running garbage.
+
+## API
+
+| Function | Description |
+|----------|-------------|
+| `install(target, detour, hook)` | Hook a function. Returns `Status::Ok` on success. |
+| `uninstall(hook)` | Remove hook and poison the trampoline. |
+| `enable(hook)` / `disable(hook)` | Toggle the patch without destroying the trampoline. |
+| `install_t<Fn>(target, detour, hook)` | Type-safe `install` wrapper. |
+| `trampoline_as<Fn>(hook)` | Cast the trampoline to a callable function pointer. |
+| `status_to_string(status)` | `Status` enum to string for diagnostics. |
 
 ## Build
 
@@ -51,24 +65,9 @@ int main() {
 cmake -B build -A x64
 cmake --build build --config Release
 .\build\Release\selfhook.exe
+.\build\Release\apitest.exe
 ```
-
-Expected output:
-
-```
-before hook: add(2, 3) = 5
-[hook] add(2, 3) -> 5  (returning real+1000)
-after hook:  add(2, 3) = 1005
-after unhook: add(2, 3) = 5
-OK
-```
-
-## Status
-
-**v0.1**: x64 inline hooks. No x86, no ARM64, no IAT/VTable shortcuts, no thread-safe atomic patching (just `VirtualProtect` + `memcpy`). Plenty for single-threaded RE/dev work; not yet hardened for multi-thread production use.
-
-**Roadmap**: thread-suspension during patch (atomic-ish), IAT helper, VTable helper, ARM64, x86 32-bit, `wait-free` hot patching via double-CAS.
 
 ## License
 
-MIT.
+MIT
