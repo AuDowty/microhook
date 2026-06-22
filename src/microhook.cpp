@@ -8,8 +8,14 @@
 namespace microhook {
 namespace {
 
+// ---- constants ----
+
 constexpr std::size_t kJmpRel32 = 5;
-constexpr std::size_t kJmpAbs   = 14;
+#ifdef _WIN64
+constexpr std::size_t kJmpAbs = 14;   // FF 25 00000000 <addr64>
+#else
+constexpr std::size_t kJmpAbs = 6;    // 68 <addr32> C3 (push/ret)
+#endif
 constexpr std::size_t kSlotSize = 96;
 constexpr std::size_t kPageSize = 0x1000;
 constexpr std::int64_t kRel32Max = 0x7FFF'FFFF;
@@ -25,11 +31,18 @@ void emit_jmp_rel32(std::uint8_t* buf, const void* from, const void* to) {
 }
 
 void emit_jmp_abs(std::uint8_t* buf, const void* to) {
+#ifdef _WIN64
     buf[0] = 0xFF; buf[1] = 0x25;
     std::int32_t zero = 0;
     std::memcpy(buf + 2, &zero, 4);
     auto addr = reinterpret_cast<std::uint64_t>(to);
     std::memcpy(buf + 6, &addr, 8);
+#else
+    buf[0] = 0x68;
+    auto addr = reinterpret_cast<std::uint32_t>(to);
+    std::memcpy(buf + 1, &addr, 4);
+    buf[5] = 0xC3;
+#endif
 }
 
 bool within_rel32(const void* from, const void* to) {
@@ -49,22 +62,27 @@ bool patch_bytes(void* dst, const void* src, std::size_t n) {
     return true;
 }
 
-// ---- slab allocator: share 4KB pages across trampolines ----
+// ---- slab allocator ----
 
 struct Slab { std::uint8_t* base; std::size_t used; };
 Slab g_slabs[64]{};
 std::size_t g_slab_count = 0;
 
-void* alloc_near(void* target) {
+void* alloc_trampoline(void* target) {
     for (std::size_t i = 0; i < g_slab_count; i++) {
         auto& s = g_slabs[i];
-        if (s.used + kSlotSize <= kPageSize && within_rel32(target, s.base + s.used)) {
-            void* p = s.base + s.used;
-            s.used += kSlotSize;
-            return p;
-        }
+        if (s.used + kSlotSize > kPageSize) continue;
+#ifdef _WIN64
+        if (!within_rel32(target, s.base + s.used)) continue;
+#else
+        (void)target;
+#endif
+        void* p = s.base + s.used;
+        s.used += kSlotSize;
+        return p;
     }
 
+#ifdef _WIN64
     SYSTEM_INFO si; GetSystemInfo(&si);
     auto gran = static_cast<std::uintptr_t>(si.dwAllocationGranularity);
     auto tgt = reinterpret_cast<std::uintptr_t>(target);
@@ -89,6 +107,15 @@ void* alloc_near(void* target) {
             g_slabs[g_slab_count++] = { static_cast<std::uint8_t*>(p), kSlotSize };
         return p;
     }
+#else
+    void* p = VirtualAlloc(nullptr, kPageSize,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (p) {
+        if (g_slab_count < 64)
+            g_slabs[g_slab_count++] = { static_cast<std::uint8_t*>(p), kSlotSize };
+        return p;
+    }
+#endif
     return nullptr;
 }
 
@@ -101,10 +128,10 @@ std::size_t modrm_extra(const std::uint8_t* code) {
     std::size_t n = 1;
 
     if (mod == 3) return n;
-    if (mod == 0 && rm == 5) { n += 4; return n; }
+    if (mod == 0 && rm == 5) { n += 4; return n; }   // [RIP+disp32] or [disp32]
     if (rm == 4) {
         n++;
-        if (mod == 0 && (code[1] & 7) == 5) n += 4;
+        if (mod == 0 && (code[1] & 7) == 5) n += 4;  // SIB base=5 + disp32
     }
     if (mod == 1) n++;
     if (mod == 2) n += 4;
@@ -113,7 +140,7 @@ std::size_t modrm_extra(const std::uint8_t* code) {
 
 bool opcode_has_modrm(std::uint8_t op) {
     if (op <= 0x3B && (op & 7) <= 3) return true;
-    if (op == 0x63) return true;
+    if (op == 0x62 || op == 0x63) return true;
     if (op == 0x69 || op == 0x6B) return true;
     if (op >= 0x80 && op <= 0x8F) return true;
     if (op == 0xC0 || op == 0xC1) return true;
@@ -126,11 +153,14 @@ bool opcode_has_modrm(std::uint8_t op) {
     return false;
 }
 
-// ---- length disassembly engine ----
+// ---- length disassembly engine (x86 + x64) ----
 
-std::size_t lde_x64(const std::uint8_t* code) {
+std::size_t lde(const std::uint8_t* code) {
     std::size_t i = 0;
-    bool has_66 = false, has_67 = false, has_rexw = false;
+    bool has_66 = false, has_67 = false;
+#ifdef _WIN64
+    bool has_rexw = false;
+#endif
 
     // legacy prefixes
     while (true) {
@@ -142,26 +172,31 @@ std::size_t lde_x64(const std::uint8_t* code) {
         if (b == 0x67) { has_67 = true; i++; continue; }
         break;
     }
+
+#ifdef _WIN64
     if ((code[i] & 0xF0) == 0x40) { has_rexw = (code[i] & 8) != 0; i++; }
+#endif
 
     std::uint8_t op = code[i++];
+
+#ifndef _WIN64
+    // x86: 0x40-0x4F are INC/DEC reg (1 byte, no operands)
+    if (op >= 0x40 && op <= 0x4F) return i;
+#endif
 
     // two-byte escape
     if (op == 0x0F) {
         std::uint8_t op2 = code[i++];
-        if (op2 >= 0x80 && op2 <= 0x8F) return i + 4;     // Jcc rel32
-        if (op2 >= 0xC8 && op2 <= 0xCF) return i;          // BSWAP
-        // zero-operand
+        if (op2 >= 0x80 && op2 <= 0x8F) return i + 4;
+        if (op2 >= 0xC8 && op2 <= 0xCF) return i;
         if (op2 == 0x05 || op2 == 0x06 || op2 == 0x07 ||
             op2 == 0x08 || op2 == 0x09 || op2 == 0x0B ||
             op2 == 0x31 || op2 == 0x34 || op2 == 0x35 ||
             op2 == 0xA2) return i;
-        // modrm + imm8
         if (op2 == 0x70 || op2 == 0x71 || op2 == 0x72 || op2 == 0x73 ||
             op2 == 0xC2 || op2 == 0xC4 || op2 == 0xC5 || op2 == 0xC6 ||
             op2 == 0xA4 || op2 == 0xAC)
             return i + modrm_extra(code + i) + 1;
-        // modrm-only (covers most 0F xx: CMOV, SETcc, MOVZX, BT, SSE, etc.)
         if ((op2 >= 0x10 && op2 <= 0x2F) || (op2 >= 0x40 && op2 <= 0x6F) ||
             (op2 >= 0x74 && op2 <= 0x7F) ||
             (op2 >= 0x90 && op2 <= 0x9F) || (op2 >= 0xA3 && op2 <= 0xAF) ||
@@ -173,13 +208,11 @@ std::size_t lde_x64(const std::uint8_t* code) {
         return 0;
     }
 
-    // branches
     if (op == 0xE8 || op == 0xE9) return i + 4;
     if (op == 0xEB) return i + 1;
     if (op >= 0x70 && op <= 0x7F) return i + 1;
     if (op == 0xE0 || op == 0xE1 || op == 0xE2 || op == 0xE3) return i + 1;
 
-    // no-operand
     if (op == 0x90) return i;
     if (op == 0xC3 || op == 0xCB) return i;
     if (op == 0xC9) return i;
@@ -195,31 +228,31 @@ std::size_t lde_x64(const std::uint8_t* code) {
     if (op == 0xCD) return i + 1;
     if (op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7) return i + 1;
 
-    // immediate-only
     if (op == 0x68) return i + (has_66 ? 2 : 4);
     if (op == 0x6A) return i + 1;
     if (op == 0xC2 || op == 0xCA) return i + 2;
-    if (op == 0xC8) return i + 3;  // ENTER imm16, imm8
+    if (op == 0xC8) return i + 3;
 
-    // MOV moffs (A0-A3): 8-byte offset in 64-bit, 4 with 67h
+#ifdef _WIN64
     if (op >= 0xA0 && op <= 0xA3) return i + (has_67 ? 4 : 8);
+#else
+    if (op >= 0xA0 && op <= 0xA3) return i + (has_67 ? 2 : 4);
+#endif
 
-    // TEST AL/AX, imm
     if (op == 0xA8) return i + 1;
     if (op == 0xA9) return i + (has_66 ? 2 : 4);
 
-    // AL/AX immediate forms (04,0C,...,3C)
     if (op <= 0x3D && (op & 7) == 4) return i + 1;
     if (op <= 0x3D && (op & 7) == 5) return i + (has_66 ? 2 : 4);
 
-    // MOV reg, imm
     if (op >= 0xB0 && op <= 0xB7) return i + 1;
     if (op >= 0xB8 && op <= 0xBF) {
+#ifdef _WIN64
         if (has_rexw) return i + 8;
+#endif
         return i + (has_66 ? 2 : 4);
     }
 
-    // modrm + immediate groups
     if (op == 0xC6) return i + modrm_extra(code + i) + 1;
     if (op == 0xC7) return i + modrm_extra(code + i) + (has_66 ? 2 : 4);
     if (op == 0x80 || op == 0x82 || op == 0x83) return i + modrm_extra(code + i) + 1;
@@ -228,7 +261,6 @@ std::size_t lde_x64(const std::uint8_t* code) {
     if (op == 0x6B) return i + modrm_extra(code + i) + 1;
     if (op == 0xC0 || op == 0xC1) return i + modrm_extra(code + i) + 1;
 
-    // F6/F7: TEST has immediate, NOT/NEG/MUL/DIV don't
     if (op == 0xF6) {
         std::size_t extra = modrm_extra(code + i);
         std::uint8_t reg = (code[i] >> 3) & 7;
@@ -240,7 +272,6 @@ std::size_t lde_x64(const std::uint8_t* code) {
         return i + extra + (reg == 0 ? (has_66 ? 2 : 4) : 0);
     }
 
-    // plain modrm
     if (opcode_has_modrm(op)) return i + modrm_extra(code + i);
 
     return 0;
@@ -270,7 +301,9 @@ InsnInfo analyze_insn(const std::uint8_t* code, std::size_t len) {
             b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67) { i++; continue; }
         break;
     }
+#ifdef _WIN64
     if (i < len && (code[i] & 0xF0) == 0x40) i++;
+#endif
     if (i >= len) return info;
 
     std::uint8_t op = code[i++];
@@ -289,21 +322,32 @@ InsnInfo analyze_insn(const std::uint8_t* code, std::size_t len) {
             info.branch = BranchType::JccRel32; info.cc = op2 & 0x0F;
             info.disp_offset = i; return info;
         }
+#ifdef _WIN64
+        // RIP-relative only exists in x64
         if (i < len && (code[i] >> 6) == 0 && (code[i] & 7) == 5) {
             info.rip_modrm = true; info.disp_offset = i + 1;
         }
+#endif
         return info;
     }
 
+#ifdef _WIN64
     if (opcode_has_modrm(op) && i < len) {
         if ((code[i] >> 6) == 0 && (code[i] & 7) == 5) {
             info.rip_modrm = true; info.disp_offset = i + 1;
         }
     }
+#endif
     return info;
 }
 
-// relocate one instruction, returns bytes written (or 0 on overflow)
+std::size_t relocated_insn_size(const std::uint8_t* insn, std::size_t len) {
+    InsnInfo info = analyze_insn(insn, len);
+    if (info.branch == BranchType::JmpRel8) return 5;
+    if (info.branch == BranchType::JccRel8) return 6;
+    return len;
+}
+
 std::size_t relocate_one(const std::uint8_t* src, std::size_t src_len,
                           std::uintptr_t src_addr,
                           std::uint8_t* dst, std::uintptr_t dst_addr) {
@@ -347,6 +391,7 @@ std::size_t relocate_one(const std::uint8_t* src, std::size_t src_len,
     default: break;
     }
 
+#ifdef _WIN64
     if (info.rip_modrm) {
         std::int32_t old_disp;
         std::memcpy(&old_disp, src + info.disp_offset, 4);
@@ -358,12 +403,34 @@ std::size_t relocate_one(const std::uint8_t* src, std::size_t src_len,
         std::memcpy(dst + info.disp_offset, &d, 4);
         return src_len;
     }
+#endif
 
     std::memcpy(dst, src, src_len);
     return src_len;
 }
 
-// ---- thread freezer ----
+// ---- thread IP mapping ----
+
+struct IpEntry { std::uintptr_t old_ip, new_ip; };
+constexpr std::size_t kMaxIpEntries = 33;
+
+std::size_t build_ip_map(const Hook& hook, IpEntry* map) {
+    auto target_addr = reinterpret_cast<std::uintptr_t>(hook.target);
+    auto tramp_addr  = reinterpret_cast<std::uintptr_t>(hook.trampoline);
+    std::size_t count = 0, src_off = 0, dst_off = 0;
+
+    while (src_off < hook.stolen_bytes && count < kMaxIpEntries - 1) {
+        map[count++] = { target_addr + src_off, tramp_addr + dst_off };
+        auto n = lde(hook.original_prologue + src_off);
+        if (n == 0) break;
+        dst_off += relocated_insn_size(hook.original_prologue + src_off, n);
+        src_off += n;
+    }
+    map[count++] = { target_addr + src_off, target_addr + src_off };
+    return count;
+}
+
+// ---- thread freezer with IP adjustment ----
 
 struct FrozenThreads {
     static constexpr std::size_t kMax = 4096;
@@ -384,13 +451,44 @@ void freeze_threads(FrozenThreads& ft) {
         do {
             if (te.th32OwnerProcessID != pid || te.th32ThreadID == tid) continue;
             if (ft.count >= FrozenThreads::kMax) break;
-            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                  THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
             if (!h) continue;
             if (SuspendThread(h) == static_cast<DWORD>(-1)) { CloseHandle(h); continue; }
             ft.handles[ft.count++] = h;
         } while (Thread32Next(snap, &te));
     }
     CloseHandle(snap);
+}
+
+// forward=true: old→new (install/enable), forward=false: new→old (uninstall/disable)
+void adjust_ips(const FrozenThreads& ft, const IpEntry* map, std::size_t map_count,
+                bool forward) {
+    for (std::size_t i = 0; i < ft.count; i++) {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        if (!GetThreadContext(ft.handles[i], &ctx)) continue;
+
+#ifdef _WIN64
+        auto ip = static_cast<std::uintptr_t>(ctx.Rip);
+#else
+        auto ip = static_cast<std::uintptr_t>(ctx.Eip);
+#endif
+
+        for (std::size_t j = 0; j + 1 < map_count; j++) {
+            std::uintptr_t lo = forward ? map[j].old_ip : map[j].new_ip;
+            std::uintptr_t hi = forward ? map[j + 1].old_ip : map[j + 1].new_ip;
+            if (ip >= lo && ip < hi) {
+#ifdef _WIN64
+                ctx.Rip = forward ? map[j].new_ip : map[j].old_ip;
+#else
+                ctx.Eip = static_cast<DWORD>(forward ? map[j].new_ip : map[j].old_ip);
+#endif
+                SetThreadContext(ft.handles[i], &ctx);
+                break;
+            }
+        }
+    }
 }
 
 void thaw_threads(FrozenThreads& ft) {
@@ -418,21 +516,20 @@ Status install(void* target, void* detour, Hook& out) {
     std::size_t stolen = 0;
 
     while (stolen < min_stolen) {
-        auto n = lde_x64(src + stolen);
+        auto n = lde(src + stolen);
         if (n == 0 || n > 15) return Status::UnsupportedPrologue;
         stolen += n;
         if (stolen > 32) return Status::UnsupportedPrologue;
     }
 
-    void* tramp_mem = alloc_near(target);
+    void* tramp_mem = alloc_trampoline(target);
     if (!tramp_mem) return Status::AllocationFailed;
     auto* tramp = static_cast<std::uint8_t*>(tramp_mem);
     auto tramp_addr = reinterpret_cast<std::uintptr_t>(tramp);
 
-    // relocate stolen instructions one by one
     std::size_t src_off = 0, dst_off = 0;
     while (src_off < stolen) {
-        auto n = lde_x64(src + src_off);
+        auto n = lde(src + src_off);
         if (n == 0) return Status::UnsupportedPrologue;
         auto written = relocate_one(src + src_off, n,
                                      src_addr + src_off,
@@ -444,28 +541,19 @@ Status install(void* target, void* detour, Hook& out) {
         if (dst_off > kSlotSize - kJmpAbs) return Status::AllocationFailed;
     }
 
-    // jump back to original code after stolen region
     auto* jump_back = src + stolen;
     if (within_rel32(tramp + dst_off + kJmpRel32, jump_back))
         emit_jmp_rel32(tramp + dst_off, tramp + dst_off, jump_back);
     else
         emit_jmp_abs(tramp + dst_off, jump_back);
 
-    // save original bytes
     std::uint8_t original[32]{};
     std::memcpy(original, src, stolen);
 
-    // build patch (jmp to detour + int3 padding)
     std::uint8_t patch[32];
     std::memset(patch, 0xCC, sizeof patch);
     if (use_rel32) emit_jmp_rel32(patch, src, detour);
     else           emit_jmp_abs(patch, detour);
-
-    FrozenThreads ft;
-    freeze_threads(ft);
-    bool ok = patch_bytes(src, patch, stolen);
-    thaw_threads(ft);
-    if (!ok) return Status::ProtectFailed;
 
     out.target = target;
     out.detour = detour;
@@ -474,6 +562,18 @@ Status install(void* target, void* detour, Hook& out) {
     out.stolen_bytes = stolen;
     out.trampoline_len = dst_off;
     std::memcpy(out.original_prologue, original, stolen);
+
+    IpEntry map[kMaxIpEntries];
+    auto map_count = build_ip_map(out, map);
+
+    FrozenThreads ft;
+    freeze_threads(ft);
+    adjust_ips(ft, map, map_count, true);
+    bool ok = patch_bytes(src, patch, stolen);
+    thaw_threads(ft);
+
+    if (!ok) return Status::ProtectFailed;
+
     out.installed = true;
     out.enabled = true;
     return Status::Ok;
@@ -482,10 +582,15 @@ Status install(void* target, void* detour, Hook& out) {
 Status uninstall(Hook& hook) {
     if (!hook.installed) return Status::NotHooked;
 
+    IpEntry map[kMaxIpEntries];
+    auto map_count = build_ip_map(hook, map);
+
     FrozenThreads ft;
     freeze_threads(ft);
+    adjust_ips(ft, map, map_count, false);
     bool ok = patch_bytes(hook.target, hook.original_prologue, hook.stolen_bytes);
     thaw_threads(ft);
+
     if (!ok) return Status::ProtectFailed;
 
     if (hook.trampoline_region)
@@ -510,10 +615,15 @@ Status enable(Hook& hook) {
     if (use_rel32) emit_jmp_rel32(patch, src, hook.detour);
     else           emit_jmp_abs(patch, hook.detour);
 
+    IpEntry map[kMaxIpEntries];
+    auto map_count = build_ip_map(hook, map);
+
     FrozenThreads ft;
     freeze_threads(ft);
+    adjust_ips(ft, map, map_count, true);
     bool ok = patch_bytes(src, patch, hook.stolen_bytes);
     thaw_threads(ft);
+
     if (!ok) return Status::ProtectFailed;
 
     hook.enabled = true;
@@ -524,10 +634,15 @@ Status disable(Hook& hook) {
     if (!hook.installed) return Status::NotHooked;
     if (!hook.enabled) return Status::AlreadyDisabled;
 
+    IpEntry map[kMaxIpEntries];
+    auto map_count = build_ip_map(hook, map);
+
     FrozenThreads ft;
     freeze_threads(ft);
+    adjust_ips(ft, map, map_count, false);
     bool ok = patch_bytes(hook.target, hook.original_prologue, hook.stolen_bytes);
     thaw_threads(ft);
+
     if (!ok) return Status::ProtectFailed;
 
     hook.enabled = false;

@@ -1,8 +1,8 @@
 # microhook
 
-C++20 x64 inline hooking library for Windows. ~550 LOC, zero dependencies.
+C++20 inline hooking library for Windows. x86 and x64, ~600 LOC, zero dependencies.
 
-Patches function prologues with a `jmp` to your detour, saves the originals to a trampoline with full instruction relocation. Handles RIP-relative addressing, short branch expansion, and thread-safe patching out of the box.
+Patches function prologues with a `jmp` to your detour, saves the originals to a trampoline with full instruction relocation. Thread IP adjustment, RIP-relative addressing (x64), short branch expansion, and slab-allocated trampolines out of the box.
 
 ## Use
 
@@ -38,15 +38,15 @@ Works on local functions, vtable entries, and Win32 APIs (`GetTickCount64`, `Mes
 
 ## How it works
 
-1. **Length disassembly** — hand-rolled LDE walks the prologue to find instruction boundaries. Covers all common x64 opcodes including two-byte `0F xx`, x87, and `F6`/`F7` TEST-with-immediate.
+1. **Length disassembly** — hand-rolled LDE walks the prologue to find instruction boundaries. Dual-mode: handles x86 (`INC`/`DEC` reg, `[disp32]`) and x64 (REX prefixes, `[RIP+disp32]`, `MOV r64,imm64`) natively via compile-time selection.
 
-2. **Instruction relocation** — stolen bytes are copied to a trampoline one instruction at a time. `[RIP+disp32]` addressing gets its displacement adjusted, short branches (`Jcc rel8`, `JMP rel8`) expand to their `rel32` equivalents, and `CALL`/`JMP rel32` offsets are recalculated.
+2. **Instruction relocation** — stolen bytes are copied to a trampoline one instruction at a time. On x64, `[RIP+disp32]` displacements are adjusted. Short branches (`Jcc rel8`, `JMP rel8`) expand to `rel32` equivalents, and `CALL`/`JMP rel32` offsets are recalculated.
 
-3. **Trampoline allocation** — a slab allocator carves 96-byte slots from shared 4KB pages within ±2GB of the target, so the patch site uses a compact 5-byte `jmp rel32`. Falls back to 14-byte absolute when needed.
+3. **Trampoline allocation** — a slab allocator carves 96-byte slots from shared 4KB pages. On x64, pages are allocated within ±2GB of the target for a compact 5-byte `jmp rel32` (14-byte absolute fallback). On x86, any page works since `rel32` covers the full address space.
 
-4. **Thread-safe patching** — all other threads are suspended during patch and unpatch via `CreateToolhelp32Snapshot` + `SuspendThread`, preventing torn reads of the partially-written jump.
+4. **Thread-safe patching with IP adjustment** — all other threads are suspended during patch/unpatch. If a suspended thread's instruction pointer is inside the patch zone, it's relocated to the corresponding trampoline offset (or back on uninstall). This prevents crashes when a thread is mid-prologue during the patch — the key correctness feature that separates production hooking from toy implementations.
 
-5. **INT3 padding** — any remaining stolen bytes after the jump are filled with `0xCC` so a stale jump into the middle crashes cleanly instead of running garbage.
+5. **INT3 padding** — remaining stolen bytes after the jump are filled with `0xCC` so a stale jump into the middle crashes cleanly.
 
 ## API
 
@@ -62,11 +62,32 @@ Works on local functions, vtable entries, and Win32 APIs (`GetTickCount64`, `Mes
 ## Build
 
 ```
+# x64
 cmake -B build -A x64
 cmake --build build --config Release
 .\build\Release\selfhook.exe
 .\build\Release\apitest.exe
+
+# x86
+cmake -B build32 -A Win32
+cmake --build build32 --config Release
+.\build32\Release\selfhook.exe
+.\build32\Release\apitest.exe
 ```
+
+## vs MinHook
+
+| | microhook | MinHook |
+|---|---|---|
+| Language | C++20 | C |
+| Architectures | x86 + x64 | x86 + x64 |
+| Thread IP adjustment | yes | yes |
+| RIP-relative relocation | yes | yes |
+| Short branch expansion | yes | yes |
+| Enable/disable | yes | yes |
+| Trampoline allocator | slab (shared pages) | buffer manager |
+| LOC | ~600 | ~2500 |
+| API | per-hook struct, no global state | global init/uninit |
 
 ## License
 
