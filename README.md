@@ -75,20 +75,6 @@ cmake --build build32 --config Release
 .\build32\Release\apitest.exe
 ```
 
-## vs MinHook
-
-| | microhook | MinHook |
-|---|---|---|
-| Language | C++20 | C |
-| Architectures | x86 + x64 | x86 + x64 |
-| Thread IP adjustment | yes | yes |
-| RIP-relative relocation | yes | yes |
-| Short branch expansion | yes | yes |
-| Enable/disable | yes | yes |
-| Trampoline allocator | slab (shared pages) | buffer manager |
-| LOC | ~600 | ~2500 |
-| API | per-hook struct, no global state | global init/uninit |
-
 ## License
 
 MIT
