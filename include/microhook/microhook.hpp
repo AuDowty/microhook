@@ -48,4 +48,17 @@ Fn* trampoline_as(const Hook& hook) {
     return reinterpret_cast<Fn*>(hook.trampoline);
 }
 
+struct ScopedHook {
+    Hook hook{};
+    ~ScopedHook() { if (hook.installed) uninstall(hook); }
+    ScopedHook() = default;
+    ScopedHook(const ScopedHook&) = delete;
+    ScopedHook& operator=(const ScopedHook&) = delete;
+    ScopedHook(ScopedHook&& o) noexcept : hook(o.hook) { o.hook = {}; }
+    ScopedHook& operator=(ScopedHook&& o) noexcept {
+        if (this != &o) { if (hook.installed) uninstall(hook); hook = o.hook; o.hook = {}; }
+        return *this;
+    }
+};
+
 }

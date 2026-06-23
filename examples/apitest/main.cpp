@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -101,6 +102,37 @@ int main() {
               "NullTarget");
         check(microhook::install((void*)1, nullptr, h) == microhook::Status::NullDetour,
               "NullDetour");
+    }
+
+    std::fprintf(stderr, "--- hook/unhook cycle (slab reuse) ---\n");
+    {
+        for (int i = 0; i < 200; i++) {
+            auto s = microhook::install_t<AddFn>(add, my_add, g_add_hook);
+            check(s == microhook::Status::Ok, "cycle install");
+            check(add(2, 3) == 1005, "cycle hooked");
+            check(microhook::uninstall(g_add_hook) == microhook::Status::Ok, "cycle uninstall");
+            check(add(2, 3) == 5, "cycle unhooked");
+        }
+    }
+
+    std::fprintf(stderr, "--- scoped hook ---\n");
+    {
+        {
+            microhook::ScopedHook sh;
+            auto s = microhook::install_t<AddFn>(add, my_add, sh.hook);
+            check(s == microhook::Status::Ok, "scoped install");
+            check(sh.hook.installed, "scoped is installed");
+        }
+        check(add(2, 3) == 5, "scoped auto-uninstall");
+
+        {
+            microhook::ScopedHook a;
+            microhook::install_t<AddFn>(add, my_add, a.hook);
+            microhook::ScopedHook b = std::move(a);
+            check(!a.hook.installed, "source cleared after move");
+            check(b.hook.installed, "dest has the hook");
+        }
+        check(add(2, 3) == 5, "moved hook auto-uninstalled");
     }
 
     if (failures == 0)

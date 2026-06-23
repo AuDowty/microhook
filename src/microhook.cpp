@@ -12,9 +12,10 @@ namespace {
 
 constexpr std::size_t kJmpRel32 = 5;
 #ifdef _WIN64
-constexpr std::size_t kJmpAbs = 14;   // FF 25 00000000 <addr64>
+constexpr std::size_t kJmpAbs   = 14;   // FF 25 00000000 <addr64>
+constexpr std::size_t kRelayOff = 96 - kJmpAbs; // relay stub at end of slot
 #else
-constexpr std::size_t kJmpAbs = 6;    // 68 <addr32> C3 (push/ret)
+constexpr std::size_t kJmpAbs   = 6;    // 68 <addr32> C3 (push/ret)
 #endif
 constexpr std::size_t kSlotSize = 96;
 constexpr std::size_t kPageSize = 0x1000;
@@ -62,26 +63,47 @@ bool patch_bytes(void* dst, const void* src, std::size_t n) {
     return true;
 }
 
-// ---- slab allocator ----
+// ---- slab allocator with free-list ----
 
 struct Slab { std::uint8_t* base; std::size_t used; };
 Slab g_slabs[64]{};
 std::size_t g_slab_count = 0;
 
+struct FreeSlot { FreeSlot* next; };
+FreeSlot* g_free_list = nullptr;
+
 void* alloc_trampoline(void* target) {
+    // check free-list first
+#ifdef _WIN64
+    FreeSlot* prev = nullptr;
+    for (auto* slot = g_free_list; slot; prev = slot, slot = slot->next) {
+        if (!within_rel32(target, slot)) continue;
+        if (prev) prev->next = slot->next;
+        else g_free_list = slot->next;
+        return slot;
+    }
+#else
+    (void)target;
+    if (g_free_list) {
+        auto* slot = g_free_list;
+        g_free_list = slot->next;
+        return slot;
+    }
+#endif
+
+    // check existing slabs
     for (std::size_t i = 0; i < g_slab_count; i++) {
         auto& s = g_slabs[i];
         if (s.used + kSlotSize > kPageSize) continue;
 #ifdef _WIN64
         if (!within_rel32(target, s.base + s.used)) continue;
-#else
-        (void)target;
 #endif
         void* p = s.base + s.used;
         s.used += kSlotSize;
         return p;
     }
 
+    // allocate new page
 #ifdef _WIN64
     SYSTEM_INFO si; GetSystemInfo(&si);
     auto gran = static_cast<std::uintptr_t>(si.dwAllocationGranularity);
@@ -119,6 +141,13 @@ void* alloc_trampoline(void* target) {
     return nullptr;
 }
 
+void free_trampoline(void* slot) {
+    std::memset(slot, 0xCC, kSlotSize);
+    auto* fs = static_cast<FreeSlot*>(slot);
+    fs->next = g_free_list;
+    g_free_list = fs;
+}
+
 // ---- modrm decoder ----
 
 std::size_t modrm_extra(const std::uint8_t* code) {
@@ -128,10 +157,10 @@ std::size_t modrm_extra(const std::uint8_t* code) {
     std::size_t n = 1;
 
     if (mod == 3) return n;
-    if (mod == 0 && rm == 5) { n += 4; return n; }   // [RIP+disp32] or [disp32]
+    if (mod == 0 && rm == 5) { n += 4; return n; }
     if (rm == 4) {
         n++;
-        if (mod == 0 && (code[1] & 7) == 5) n += 4;  // SIB base=5 + disp32
+        if (mod == 0 && (code[1] & 7) == 5) n += 4;
     }
     if (mod == 1) n++;
     if (mod == 2) n += 4;
@@ -144,13 +173,26 @@ bool opcode_has_modrm(std::uint8_t op) {
     if (op == 0x69 || op == 0x6B) return true;
     if (op >= 0x80 && op <= 0x8F) return true;
     if (op == 0xC0 || op == 0xC1) return true;
-    if (op == 0xC4 || op == 0xC5) return true;
+#ifndef _WIN64
+    if (op == 0xC4 || op == 0xC5) return true; // LES/LDS (x86 only; x64 = VEX)
+#endif
     if (op == 0xC6 || op == 0xC7) return true;
     if (op >= 0xD0 && op <= 0xD3) return true;
     if (op >= 0xD8 && op <= 0xDF) return true;
     if (op == 0xF6 || op == 0xF7) return true;
     if (op == 0xFE || op == 0xFF) return true;
     return false;
+}
+
+// ---- VEX helpers ----
+
+bool vex_has_imm8(std::uint8_t op, std::uint8_t map) {
+    if (map == 3) return true;   // 0F 3A: all have imm8
+    if (map != 1) return false;  // 0F 38 etc: no imm8
+    // map 1 (0F): specific opcodes
+    return op == 0xC2 || op == 0xC4 || op == 0xC5 || op == 0xC6 ||
+           op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 ||
+           op == 0xA4 || op == 0xAC;
 }
 
 // ---- length disassembly engine (x86 + x64) ----
@@ -162,7 +204,6 @@ std::size_t lde(const std::uint8_t* code) {
     bool has_rexw = false;
 #endif
 
-    // legacy prefixes
     while (true) {
         std::uint8_t b = code[i];
         if (b == 0xF0 || b == 0xF2 || b == 0xF3 ||
@@ -180,13 +221,59 @@ std::size_t lde(const std::uint8_t* code) {
     std::uint8_t op = code[i++];
 
 #ifndef _WIN64
-    // x86: 0x40-0x4F are INC/DEC reg (1 byte, no operands)
-    if (op >= 0x40 && op <= 0x4F) return i;
+    if (op >= 0x40 && op <= 0x4F) return i; // x86: INC/DEC reg
 #endif
 
-    // two-byte escape
+    // ---- VEX prefix ----
+#ifdef _WIN64
+    if (op == 0xC5) {
+        i++;
+        std::uint8_t vex_op = code[i++];
+        std::size_t n = i + modrm_extra(code + i);
+        if (vex_has_imm8(vex_op, 1)) n++;
+        return n;
+    }
+    if (op == 0xC4) {
+        std::uint8_t map = code[i] & 0x1F;
+        i += 2;
+        std::uint8_t vex_op = code[i++];
+        std::size_t n = i + modrm_extra(code + i);
+        if (vex_has_imm8(vex_op, map)) n++;
+        return n;
+    }
+#else
+    // x86: VEX if second byte has mod=11 (invalid for LES/LDS)
+    if (op == 0xC5 && (code[i] & 0xC0) == 0xC0) {
+        i++;
+        std::uint8_t vex_op = code[i++];
+        std::size_t n = i + modrm_extra(code + i);
+        if (vex_has_imm8(vex_op, 1)) n++;
+        return n;
+    }
+    if (op == 0xC4 && (code[i] & 0xC0) == 0xC0) {
+        std::uint8_t map = code[i] & 0x1F;
+        i += 2;
+        std::uint8_t vex_op = code[i++];
+        std::size_t n = i + modrm_extra(code + i);
+        if (vex_has_imm8(vex_op, map)) n++;
+        return n;
+    }
+#endif
+
+    // ---- two-byte escape ----
     if (op == 0x0F) {
         std::uint8_t op2 = code[i++];
+
+        // three-byte escape maps
+        if (op2 == 0x38) {
+            i++;
+            return i + modrm_extra(code + i);
+        }
+        if (op2 == 0x3A) {
+            i++;
+            return i + modrm_extra(code + i) + 1;
+        }
+
         if (op2 >= 0x80 && op2 <= 0x8F) return i + 4;
         if (op2 >= 0xC8 && op2 <= 0xCF) return i;
         if (op2 == 0x05 || op2 == 0x06 || op2 == 0x07 ||
@@ -308,6 +395,28 @@ InsnInfo analyze_insn(const std::uint8_t* code, std::size_t len) {
 
     std::uint8_t op = code[i++];
 
+    // ---- VEX: skip to ModRM for RIP-relative check ----
+#ifdef _WIN64
+    if (op == 0xC5) {
+        i += 2; // payload + opcode
+        if (i < len && (code[i] >> 6) == 0 && (code[i] & 7) == 5) {
+            info.rip_modrm = true; info.disp_offset = i + 1;
+        }
+        return info;
+    }
+    if (op == 0xC4) {
+        i += 3; // 2 payloads + opcode
+        if (i < len && (code[i] >> 6) == 0 && (code[i] & 7) == 5) {
+            info.rip_modrm = true; info.disp_offset = i + 1;
+        }
+        return info;
+    }
+#else
+    if ((op == 0xC5 || op == 0xC4) && i < len && (code[i] & 0xC0) == 0xC0) {
+        return info; // VEX on x86: no RIP-relative
+    }
+#endif
+
     if (op == 0xE8) { info.branch = BranchType::CallRel32; info.disp_offset = i; return info; }
     if (op == 0xE9) { info.branch = BranchType::JmpRel32;  info.disp_offset = i; return info; }
     if (op == 0xEB) { info.branch = BranchType::JmpRel8;   info.disp_offset = i; return info; }
@@ -318,12 +427,23 @@ InsnInfo analyze_insn(const std::uint8_t* code, std::size_t len) {
 
     if (op == 0x0F && i < len) {
         std::uint8_t op2 = code[i++];
+
+        // three-byte escape
+        if (op2 == 0x38 || op2 == 0x3A) {
+            i++;
+#ifdef _WIN64
+            if (i < len && (code[i] >> 6) == 0 && (code[i] & 7) == 5) {
+                info.rip_modrm = true; info.disp_offset = i + 1;
+            }
+#endif
+            return info;
+        }
+
         if (op2 >= 0x80 && op2 <= 0x8F) {
             info.branch = BranchType::JccRel32; info.cc = op2 & 0x0F;
             info.disp_offset = i; return info;
         }
 #ifdef _WIN64
-        // RIP-relative only exists in x64
         if (i < len && (code[i] >> 6) == 0 && (code[i] & 7) == 5) {
             info.rip_modrm = true; info.disp_offset = i + 1;
         }
@@ -461,7 +581,6 @@ void freeze_threads(FrozenThreads& ft) {
     CloseHandle(snap);
 }
 
-// forward=true: old→new (install/enable), forward=false: new→old (uninstall/disable)
 void adjust_ips(const FrozenThreads& ft, const IpEntry* map, std::size_t map_count,
                 bool forward) {
     for (std::size_t i = 0; i < ft.count; i++) {
@@ -511,10 +630,15 @@ Status install(void* target, void* detour, Hook& out) {
 
     auto* src = static_cast<std::uint8_t*>(target);
     auto src_addr = reinterpret_cast<std::uintptr_t>(src);
+
+#ifdef _WIN64
+    std::size_t min_stolen = kJmpRel32; // relay handles far detours
+#else
     bool use_rel32 = within_rel32(src + kJmpRel32, detour);
     std::size_t min_stolen = use_rel32 ? kJmpRel32 : kJmpAbs;
-    std::size_t stolen = 0;
+#endif
 
+    std::size_t stolen = 0;
     while (stolen < min_stolen) {
         auto n = lde(src + stolen);
         if (n == 0 || n > 15) return Status::UnsupportedPrologue;
@@ -552,8 +676,18 @@ Status install(void* target, void* detour, Hook& out) {
 
     std::uint8_t patch[32];
     std::memset(patch, 0xCC, sizeof patch);
+
+#ifdef _WIN64
+    if (!within_rel32(src + kJmpRel32, detour)) {
+        emit_jmp_abs(tramp + kRelayOff, detour);
+        emit_jmp_rel32(patch, src, tramp + kRelayOff);
+    } else {
+        emit_jmp_rel32(patch, src, detour);
+    }
+#else
     if (use_rel32) emit_jmp_rel32(patch, src, detour);
     else           emit_jmp_abs(patch, detour);
+#endif
 
     out.target = target;
     out.detour = detour;
@@ -594,7 +728,7 @@ Status uninstall(Hook& hook) {
     if (!ok) return Status::ProtectFailed;
 
     if (hook.trampoline_region)
-        std::memset(hook.trampoline_region, 0xCC, kSlotSize);
+        free_trampoline(hook.trampoline_region);
 
     hook.installed = false;
     hook.enabled = false;
@@ -608,12 +742,23 @@ Status enable(Hook& hook) {
     if (hook.enabled) return Status::AlreadyEnabled;
 
     auto* src = static_cast<std::uint8_t*>(hook.target);
-    bool use_rel32 = within_rel32(src + kJmpRel32, hook.detour);
 
     std::uint8_t patch[32];
     std::memset(patch, 0xCC, sizeof patch);
+
+#ifdef _WIN64
+    if (!within_rel32(src + kJmpRel32, hook.detour)) {
+        auto* relay = static_cast<std::uint8_t*>(hook.trampoline) + kRelayOff;
+        emit_jmp_abs(relay, hook.detour);
+        emit_jmp_rel32(patch, src, relay);
+    } else {
+        emit_jmp_rel32(patch, src, hook.detour);
+    }
+#else
+    bool use_rel32 = within_rel32(src + kJmpRel32, hook.detour);
     if (use_rel32) emit_jmp_rel32(patch, src, hook.detour);
     else           emit_jmp_abs(patch, hook.detour);
+#endif
 
     IpEntry map[kMaxIpEntries];
     auto map_count = build_ip_map(hook, map);
